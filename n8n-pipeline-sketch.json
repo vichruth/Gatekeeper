@@ -1,0 +1,855 @@
+{
+  "name": "Sprinto - Discovery to Shipped Internal Tool (structural sketch)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                3
+              ],
+              "triggerAtHour": 16,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "id": "p0-schedule",
+      "name": "PHASE 0 - Weekly Trigger (fires after the QCM)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "notes": "D1: weekly batch, not continuous. Continuous discovery floods the reviewer and turns the approval queue into the bottleneck - the exact failure the brief asks about. A weekly batch produces a ranked shortlist, which is a reviewable unit of work, and it paces the pipeline.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "internal-friction-form",
+        "options": {}
+      },
+      "id": "p0-form",
+      "name": "PHASE 0 - Form Submission Endpoint (secondary input)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        320
+      ],
+      "webhookId": "p0-form-hook",
+      "notes": "D1 secondary input: the optional structured form. Catches the person who will not speak up in front of colleagues and management, plus problems too embarrassing or too normalised to raise in a meeting. Asks subjective (1-5 affected, 1-5 stress) AND objective (hours/week). Also the entry point for the below-threshold high-conviction route in D3.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "p0-store",
+      "name": "PHASE 0 - Persist Submission to Candidate Store",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        260,
+        320
+      ],
+      "notes": "Deliberately does NOT run the pipeline on arrival. Submissions accumulate and are swept up by the weekly trigger - this is where the batch-not-stream decision (D5) actually lives in the topology, rather than just being asserted in prose. PLATFORM: a table/state store on the internal platform.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// PHASE 1 - Normalise: QCM notes + form submissions -> one candidate object\n// D1: the meeting and the form cover each other's blind spots, but once\n// ingested they must score on equal footing, so both collapse to one shape\n// here and nothing downstream knows or cares which source a report came from.\n//\n// SKETCH: raw inputs are stubbed. In the real build this is two tool calls -\n// the QCM minutes doc, and the form's stored submissions since last run.\n\nconst RAW = {\n  qcm: [\n    { role: 'compliance-analyst', person: 'p1', reportedAt: '2026-08-11',\n      problem: 'Manual SOC2 evidence collation',\n      description: 'Screenshots copied by hand into the evidence folder weekly.',\n      hoursPerWeek: 3, affected: 4, stress: 4 },\n    { role: 'compliance-analyst', person: 'p2', reportedAt: '2026-08-11',\n      problem: 'Manual SOC2 evidence collation',\n      description: 'Same collation work, plus chasing people for missing artefacts.',\n      hoursPerWeek: 4, affected: 5, stress: 4 }\n  ],\n  form: [\n    { role: 'people-ops', person: 'p9', reportedAt: '2026-08-09',\n      problem: 'Onboarding checklist tracked by hand',\n      description: 'Spreadsheet drifts out of sync; I re-check every new joiner manually, ~5h/wk.',\n      hoursPerWeek: 5, affected: 5, stress: 4 }\n  ]\n};\n\n// Role-pool sizes - D2 normalises by role, never by company headcount:\n// 4 of 4 compliance people drowning beats 15 of 200 mildly annoyed.\nconst ROLE_POOL = { 'compliance-analyst': 4, 'people-ops': 6 };\n\n// OPEN (pipeline design): clustering different phrasings of the SAME problem\n// is itself a judgment task and probably an LLM step, not a string key.\n// Stubbed here as exact-title grouping so the sketch stays readable.\nconst byProblem = {};\nfor (const [source, rows] of Object.entries(RAW)) {\n  for (const r of rows) {\n    const key = r.role + '::' + r.problem;\n    byProblem[key] = byProblem[key] || {\n      id: key, title: r.problem, role: r.role,\n      rolePool: { role: r.role, size: ROLE_POOL[r.role] ?? null },\n      reports: []\n    };\n    byProblem[key].reports.push({\n      source, person: r.person, reportedAt: r.reportedAt,\n      hoursPerWeek: r.hoursPerWeek, affected: r.affected,\n      stress: r.stress, description: r.description\n    });\n  }\n}\n\nreturn Object.values(byProblem).map(c => ({ json: { candidate: {\n  ...c,\n  stage: 'normalised',\n  log: [{ phase: 'P1', action: 'normalised', reports: c.reports.length, at: new Date().toISOString() }]\n}}}));"
+      },
+      "id": "p1-norm",
+      "name": "PHASE 1 - Normalise QCM Notes + Form Submissions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "notes": "Both sources collapse into one candidate object so nothing downstream needs to know where a report came from.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// PHASE 2a - Threshold: 25% of the role-pool, time-decayed\n// D2: the fraction and the window matter equally. 25% inside a quarter is a\n// live problem; 25% accumulated over three years is background noise. So each\n// report's weight halves every HALF_LIFE_DAYS instead of counting forever.\n// D3: below-threshold does NOT mean discarded - a lone well-evidenced report\n// still reaches a human. A rigid threshold must never SILENTLY kill an idea.\n\nconst THRESHOLD = 0.25;\nconst HALF_LIFE_DAYS = 90;            // one quarter\nconst CONVICTION_HOURS = 4;           // hours/week that count as 'real numbers'\nconst CONVICTION_DESC_CHARS = 120;    // a concrete description, not a one-liner\n\nconst now = Date.now();\nconst out = [];\n\nfor (const item of $input.all()) {\n  const c = item.json.candidate;\n  const pool = c.rolePool.size;\n\n  if (!pool) {\n    // Nothing is silently dropped - unknown pool size is an escalation,\n    // not a default-to-zero.\n    c.routing = { route: 'needs_context', reason: 'role-pool size unknown' };\n    out.push({ json: { candidate: c } });\n    continue;\n  }\n\n  const weighted = c.reports.reduce((sum, r) => {\n    const ageDays = (now - new Date(r.reportedAt).getTime()) / 86400000;\n    return sum + Math.pow(0.5, ageDays / HALF_LIFE_DAYS);\n  }, 0);\n\n  const decayedFraction = weighted / pool;\n  const distinctPeople = new Set(c.reports.map(r => r.person)).size;\n\n  // D3 route 2: below threshold, but a form submission carries real numbers.\n  const highConviction = c.reports.some(r =>\n    r.source === 'form' &&\n    (r.hoursPerWeek ?? 0) >= CONVICTION_HOURS &&\n    (r.description || '').length >= CONVICTION_DESC_CHARS\n  );\n\n  c.threshold = {\n    decayedFraction: Number(decayedFraction.toFixed(3)),\n    thresholdUsed: THRESHOLD,\n    halfLifeDays: HALF_LIFE_DAYS,\n    distinctPeople,\n    rolePoolSize: pool\n  };\n\n  c.routing = decayedFraction >= THRESHOLD\n    ? { route: 'high_signal', reason: 'met 25% of role-pool in-window' }\n    : highConviction\n      ? { route: 'low_signal_high_conviction', reason: 'below threshold but evidenced hours + concrete description' }\n      : { route: 'parked', reason: 'below threshold, no hard evidence - carried, not deleted' };\n\n  c.stage = 'thresholded';\n  c.log.push({ phase: 'P2a', action: 'thresholded', route: c.routing.route, fraction: c.threshold.decayedFraction });\n  out.push({ json: { candidate: c } });\n}\n\nreturn out;"
+      },
+      "id": "p2-thresh",
+      "name": "PHASE 2a - Threshold: 25% Role-Pool + Time Decay",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        0
+      ],
+      "notes": "D2: 25% of the ROLE POOL, not raw headcount, with each report's weight halving every quarter. Raw counts silently kill small-team problems, which are often the most acute.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "You are the Scorer in an internal-tooling discovery pipeline.\nReturn TWO separate scores. Never collapse them into one number - the human reviewer must see value-of-fixing and distress independently.\n\n1. impactScore (0-100): the value of fixing this.\n   - direct: hours recovered, task completion speed\n   - indirect: morale/retention effect of people seeing reported problems actually solved, which also raises willingness to report the NEXT problem and feeds discovery\n2. sentimentScore (0-100): how much distress the problem is causing.\n\nAlso assess: recurrence over time, automatability (rule-shaped work scores high; judgment-shaped work is a bad first target), and blastRadius (what breaks if the tool is wrong).\n\nTreat self-reported affected/stress ratings as WEAK, GAMEABLE signals. People anchor differently and scores inflate once staff learn high numbers get action. Cross-check them against reported hours lost and recurrence.\n\nYou must emit a confidence (0-1) and an explicit list of unresolvedAssumptions. If you had to guess something material, say so - do not paper over it.\n\nReply with JSON only: {impactScore, impactBreakdown:{direct,indirect}, sentimentScore, recurrence, automatability, blastRadius, confidence, unresolvedAssumptions:[string]}",
+              "role": "system"
+            },
+            {
+              "content": "={{ JSON.stringify($json.candidate) }}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "id": "p2-score",
+      "name": "PHASE 2b - Score: Impact + Sentiment (structured JSON)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        780,
+        0
+      ],
+      "notes": "Emits two separate scores plus confidence and unresolved assumptions. Structured JSON so the boundary can be schema-validated by the next node instead of trusted.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// PHASE 2c - Fold LLM scores back into candidate state + validate\n// STRUCTURAL POINT worth keeping: the LLM node REPLACES the item payload, so\n// the candidate would be lost here if it were not explicitly re-merged. This\n// is exactly the 'how does state carry across agents' question in the brief -\n// state is re-attached at every boundary, never assumed to survive.\n\nconst out = [];\nfor (let i = 0; i < $input.all().length; i++) {\n  const scored = $input.all()[i].json;                       // LLM output\n  const c = $('PHASE 2a - Threshold: 25% Role-Pool + Time Decay').all()[i].json.candidate;\n\n  const required = ['impactScore', 'sentimentScore', 'confidence', 'unresolvedAssumptions'];\n  const missing = required.filter(k => !(k in scored));\n\n  if (missing.length) {\n    // Retry-once-then-escalate belongs here. Never pass a malformed artifact\n    // downstream, and never drop it silently.\n    c.qc = { status: 'schema_failed', missing, action: 'retry once, then escalate to human' };\n    c.routing = { route: 'needs_context', reason: 'scorer returned malformed output' };\n  } else {\n    c.scores = scored;\n    c.qc = { status: 'ok' };\n    // D2 limitation, stated deliberately: self-reported severity is noisy and\n    // gameable, so sentiment is cross-checked, never a headline number.\n    c.scores.sentimentCaveat = 'self-reported, gameable; weak signal cross-checked against hours lost + recurrence';\n  }\n\n  c.stage = 'scored';\n  c.log.push({ phase: 'P2c', action: 'scores_merged', qc: c.qc.status });\n  out.push({ json: { candidate: c } });\n}\nreturn out;"
+      },
+      "id": "p2-merge",
+      "name": "PHASE 2c - Merge Scores into State + Schema Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        0
+      ],
+      "notes": "The LLM node replaces the payload, so candidate state is explicitly re-attached here. Malformed output is retried once then escalated - never passed downstream, never dropped.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// PHASE 2d - Rank the weekly batch into ONE reviewable shortlist\n// D1/D5: the whole point of a weekly batch over continuous discovery is that\n// it produces a reviewable UNIT OF WORK. The team lead sees one ranked list,\n// not thirty interruptions.\n// Two scores are carried side by side and deliberately NOT collapsed into a\n// single number (D2) - the human sees value-of-fixing and distress separately.\n\nconst ranked = $input.all()\n  .map(i => i.json.candidate)\n  .sort((a, b) => (b.scores?.impactScore ?? 0) - (a.scores?.impactScore ?? 0));\n\nranked.forEach((c, idx) => {\n  c.shortlistRank = idx + 1;\n  c.log.push({ phase: 'P2d', action: 'ranked', rank: idx + 1 });\n});\n\nreturn ranked.map(c => ({ json: { candidate: c } }));"
+      },
+      "id": "p2-rank",
+      "name": "PHASE 2d - Rank Shortlist for Gate 1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        0
+      ],
+      "notes": "Produces the one reviewable unit of work the team lead sees each week.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r1",
+                    "leftValue": "={{ $json.candidate.routing.route }}",
+                    "rightValue": "high_signal",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Route A - high signal (>=25%)"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r2",
+                    "leftValue": "={{ $json.candidate.routing.route }}",
+                    "rightValue": "low_signal_high_conviction",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Route B - below threshold, high conviction"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r3",
+                    "leftValue": "={{ $json.candidate.routing.route }}",
+                    "rightValue": "needs_context",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Blocked - needs context"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Parked - carried to next batch"
+        }
+      },
+      "id": "p3-switch",
+      "name": "PHASE 3 - Route to Gate 1 (two entry routes)",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1560,
+        0
+      ],
+      "notes": "D3: two DELIBERATE routes that converge on the same gate, not one path with a rare exception. Route A is a fast sanity-check of a strong signal. Route B is a genuine judgment call - overriding a threshold. A rigid threshold must never be able to silently kill a good idea.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "p3-parked",
+      "name": "PARKED - Carried to Next Weekly Batch (not deleted)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1820,
+        400
+      ],
+      "notes": "Below threshold and no hard evidence. Stays in the store and re-scores next week as reports accumulate and decay - the difference between 'not yet' and 'no'. PLATFORM: state store.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "p3-blocked",
+      "name": "BLOCKED - Escalate with the Specific Question",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1820,
+        560
+      ],
+      "notes": "The system is genuinely uncertain (e.g. role-pool size unknown) so it asks rather than guesses, and it asks a SPECIFIC question rather than dumping the candidate on a human. PLATFORM: notification with the question attached.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {}
+      },
+      "id": "g1-wait",
+      "name": "GATE 1 - Wait: Team Lead 'Is this worth our time?'",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1820,
+        0
+      ],
+      "webhookId": "g1-wait-hook",
+      "notes": "REVIEWER: AI implementation team lead - only they can judge feasibility and build cost, and only they hold the org context (is someone already fixing this, does it clash with the roadmap, is it politically live). ACTION: pick from the ranked shortlist, or reject. WHY HERE: cheap decision before an expensive artifact. Writing the PRD first would waste compute and, worse, ANCHOR the reviewer - a polished PRD makes a mediocre idea look legitimate, shifting the question from 'is this worth doing' to 'this looks thorough'. Other candidates keep flowing while this one waits (D5).",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// GATE 1 - record the team lead's decision into the append-only log\n// D4 Gate 1 asks 'is this worth our time?' and the action is: pick from the\n// ranked shortlist, or reject. Body arrives on the Wait node's resume URL.\n\nconst c = $json.candidate ?? $('PHASE 2d - Rank Shortlist for Gate 1').first().json.candidate;\nconst decision = $json.body ?? { approved: true, reviewer: 'ai-impl-lead', reason: 'sketch default' };\n\nc.gate1 = {\n  reviewer: 'AI implementation team lead',\n  question: 'Is this worth our time?',\n  approved: decision.approved !== false,\n  reason: decision.reason ?? null,\n  decidedAt: new Date().toISOString()\n};\nc.stage = c.gate1.approved ? 'gate1_approved' : 'gate1_rejected';\nc.log.push({ phase: 'G1', action: c.stage, reviewer: c.gate1.reviewer });\n\nreturn [{ json: { candidate: c } }];"
+      },
+      "id": "g1-rec",
+      "name": "GATE 1 - Record Team Lead Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        0
+      ],
+      "notes": "Appends to the decision log. Every human action is recorded, so the pipeline can be audited after the fact and gate rejection rate can be measured.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "g1if",
+              "leftValue": "={{ $json.candidate.gate1.approved }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "g1-if",
+      "name": "GATE 1 - Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2340,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "g1-term",
+      "name": "TERMINATED at Gate 1 - Rejected (logged with reason)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2600,
+        320
+      ],
+      "notes": "Where the loop exits early. The rejection and its reason are logged rather than discarded, because gate rejection rate is a metric: too low means rubber-stamping, too high means discovery is broken.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "You are the Definer. Draft a PRD for the approved use case.\n\nRequired fields: problem, users, scope (in and out), requirements, successCriteria.\n\nGround every requirement in the evidence supplied. Where the evidence does not support a requirement, do not invent one - list the gap in openQuestions instead. A plausible-but-wrong PRD is the worst failure mode in this pipeline: it looks fine and ships the wrong thing.\n\nThe next reviewer is the person who raised the problem, so write the problem statement in THEIR words, close enough that they can tell at a glance whether it has been understood.\n\nReply with JSON only: {problem, users:[string], scope:{inScope:[string], outOfScope:[string]}, requirements:[string], successCriteria:[string], openQuestions:[string], confidence}",
+              "role": "system"
+            },
+            {
+              "content": "={{ JSON.stringify($json.candidate) }}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "id": "p4-prd",
+      "name": "PHASE 4a - Definer: Draft the PRD",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        2600,
+        0
+      ],
+      "notes": "Takes the approved candidate plus its evidence, hands off a structured PRD: problem, users, scope, requirements, success criteria. Only runs AFTER Gate 1 so no compute is spent on ideas that were never worth doing.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// PHASE 4b - Fold the drafted PRD back into candidate state + self-critique\n// Same state re-attachment as Phase 2c. The self-critique pass runs BEFORE the\n// human sees it (open item B): the agent grades its own PRD against a checklist\n// so obvious gaps never reach Gate 2 and waste the problem owner's attention.\n\nconst prd = $json;\nconst c = $('GATE 1 - Record Team Lead Decision').first().json.candidate;\n\nconst checklist = ['problem', 'users', 'scope', 'requirements', 'successCriteria'];\nconst gaps = checklist.filter(k => !prd[k] || (Array.isArray(prd[k]) && !prd[k].length));\n\nc.prd = prd;\nc.prdSelfCritique = {\n  gaps,\n  passed: gaps.length === 0,\n  // Low confidence routes to the human WITH the specific question attached,\n  // rather than the agent guessing (open item C).\n  escalationQuestion: gaps.length ? `PRD is missing: ${gaps.join(', ')} - ask the reporter directly.` : null\n};\nc.stage = 'prd_drafted';\nc.log.push({ phase: 'P4b', action: 'prd_drafted', selfCritiquePassed: c.prdSelfCritique.passed });\n\nreturn [{ json: { candidate: c } }];"
+      },
+      "id": "p4-merge",
+      "name": "PHASE 4b - Merge PRD into State + Self-Critique",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        0
+      ],
+      "notes": "Self-critique runs before the human is involved: the agent grades its own PRD against a checklist so obvious gaps never reach Gate 2 and waste the reporter's attention.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {}
+      },
+      "id": "g2-wait",
+      "name": "GATE 2 - Wait: Reporter 'Did we understand it?'",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3120,
+        0
+      ],
+      "webhookId": "g2-wait-hook",
+      "notes": "REVIEWER: the person who RAISED the problem - deliberately not the team lead, because only the reporter knows whether the PRD describes their actual pain. ACTION: edit and approve. WHY HERE: a genuinely different question from Gate 1, and the cheapest possible place to catch a misread - every downstream step compounds this error. This is the costly review, and it sits in the middle where catching an error still saves the most downstream work.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// GATE 2 - apply the problem owner's edits\n// D4: the reviewer here is the PERSON WHO RAISED IT, not the team lead - only\n// they know whether the PRD describes their actual pain. The action is edit\n// and approve, not reject: by this point the problem is already agreed to be\n// worth solving (that was Gate 1's question), so the only open question is\n// whether it has been understood correctly.\n\nconst c = $('PHASE 4b - Merge PRD into State + Self-Critique').first().json.candidate;\nconst edits = $json.body?.prdEdits ?? {};\n\nc.prd = { ...c.prd, ...edits };\nc.gate2 = {\n  reviewer: 'the person who raised the problem',\n  question: 'Did the system understand the problem correctly?',\n  editedFields: Object.keys(edits),\n  approvedAt: new Date().toISOString()\n};\nc.stage = 'prd_approved';\nc.log.push({ phase: 'G2', action: 'prd_approved', editedFields: c.gate2.editedFields });\n\nreturn [{ json: { candidate: c } }];"
+      },
+      "id": "g2-apply",
+      "name": "GATE 2 - Apply Reporter Edits to PRD",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3380,
+        0
+      ],
+      "notes": "Feedback is incorporated by merging edits into the PRD, and the edited fields are logged - repeated edits to the same field are a signal the Definer prompt is systematically wrong.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "p5-design",
+      "name": "PHASE 5 - Generate Wireframe Variants [platform capability]",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3640,
+        0
+      ],
+      "notes": "OUTSIDE N8N'S SCOPE. PLATFORM: takes the approved PRD and produces 2-3 mock-up variants of the proposed solution. Variants rather than one design is deliberate (D5) - choosing between options is a far cheaper human action than blank-page review, and taste/internal convention is not inferable from a PRD.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "p6-build",
+      "name": "PHASE 6 - Build Internal App on Platform [platform capability]",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3900,
+        0
+      ],
+      "notes": "OUTSIDE N8N'S SCOPE. PLATFORM: assembles a working internal app from the approved PRD and chosen design, per the brief's assumption that the low-code platform can deploy a simple app. Scope creep is the failure mode to watch here - the build must implement the approved PRD, not an expanded reading of it.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {}
+      },
+      "id": "g3-wait",
+      "name": "GATE 3 - Wait: Team Lead 'Safe to go live?' (DEFAULTS TO HALT)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        4160,
+        0
+      ],
+      "webhookId": "g3-wait-hook",
+      "notes": "REVIEWER: AI implementation team lead. ACTION: one-click approve to ship. WHY HERE: blast radius, NOT quality - anything touching real internal data or another team's workflow needs a human before it goes live. ASYMMETRIC DEFAULT (D5): low-risk gates may default-to-proceed on timeout; this one always defaults to HALT. The cheap gate sits at the end because by now the artifact is expensive but the question is a one-click yes/no.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "g3if",
+              "leftValue": "={{ $json.body.approved }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "g3-if",
+      "name": "GATE 3 - Approved to Ship?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4420,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "g3-halt",
+      "name": "HALTED at Gate 3 - Not Deployed",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        4680,
+        320
+      ],
+      "notes": "Timeout or rejection both land here. Nothing ships without an explicit human yes.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "p7-ship",
+      "name": "PHASE 7 - Deploy + Instrument for 30-Day Usage [platform capability]",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        4680,
+        0
+      ],
+      "notes": "OUTSIDE N8N'S SCOPE. PLATFORM: deploys the app and starts the usage instrumentation that feeds the real metric - percentage of shipped tools still in use after 30 days, NOT apps shipped.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "content": "## Sprinto - Discovery to Shipped Internal Tool\n### STRUCTURAL SKETCH, NOT A RUNNABLE WORKFLOW\n\nImplements D1-D5 of DESIGN_DECISIONS.md.\n\nRead left to right. Node names carry PHASE and GATE numbers.\nEvery node has a **note** (the little document icon) explaining\nthe decision behind it - open them, that is where the reasoning is.\n\n**Deliberately not runnable:** raw inputs are stubbed, LLM nodes\nhave no credentials, and Phases 5-7 are NoOp placeholders for\ncapabilities the internal low-code platform provides, not n8n.",
+        "height": 300,
+        "width": 620,
+        "color": 7
+      },
+      "id": "s-title",
+      "name": "Note s-title",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -420
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## THE THREE GATES\n\nEach gate asks a **different question**, and the questions get\ncheaper to answer as the artifact gets more expensive to produce.\nThe costly review sits in the middle, where catching an error\nstill saves the most downstream work.\n\n**G1** catches the *wrong* problem - team lead, before the PRD\n**G2** catches the *misunderstood* problem - the reporter, after the PRD\n**G3** catches the *unsafe deployment* - team lead, before it goes live\n\nRemoving any one leaves an error class uncaught.",
+        "height": 300,
+        "width": 720,
+        "color": 3
+      },
+      "id": "s-gates",
+      "name": "Note s-gates",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1800,
+        -420
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### State carries as ONE candidate object\nEvery node re-attaches and extends it; nothing is passed as loose\ncontext. `candidate.log` is append-only - every agent action and\nevery human decision lands in it, which is what makes gate\nrejection rate measurable after the fact.",
+        "height": 180,
+        "width": 440,
+        "color": 5
+      },
+      "id": "s-state",
+      "name": "Note s-state",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### The human is never on the critical path\nWhile one candidate waits at a gate, ingestion, scoring and\nranking keep running for every other candidate. A slow reviewer\ndelays one item, never the pipeline.",
+        "height": 180,
+        "width": 440,
+        "color": 5
+      },
+      "id": "s-nonblock",
+      "name": "Note s-nonblock",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3100,
+        -300
+      ]
+    }
+  ],
+  "connections": {
+    "PHASE 0 - Weekly Trigger (fires after the QCM)": {
+      "main": [
+        [
+          {
+            "node": "PHASE 1 - Normalise QCM Notes + Form Submissions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHASE 0 - Form Submission Endpoint (secondary input)": {
+      "main": [
+        [
+          {
+            "node": "PHASE 0 - Persist Submission to Candidate Store",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHASE 1 - Normalise QCM Notes + Form Submissions": {
+      "main": [
+        [
+          {
+            "node": "PHASE 2a - Threshold: 25% Role-Pool + Time Decay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHASE 2a - Threshold: 25% Role-Pool + Time Decay": {
+      "main": [
+        [
+          {
+            "node": "PHASE 2b - Score: Impact + Sentiment (structured JSON)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHASE 2b - Score: Impact + Sentiment (structured JSON)": {
+      "main": [
+        [
+          {
+            "node": "PHASE 2c - Merge Scores into State + Schema Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHASE 2c - Merge Scores into State + Schema Check": {
+      "main": [
+        [
+          {
+            "node": "PHASE 2d - Rank Shortlist for Gate 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHASE 2d - Rank Shortlist for Gate 1": {
+      "main": [
+        [
+          {
+            "node": "PHASE 3 - Route to Gate 1 (two entry routes)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHASE 3 - Route to Gate 1 (two entry routes)": {
+      "main": [
+        [
+          {
+            "node": "GATE 1 - Wait: Team Lead 'Is this worth our time?'",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GATE 1 - Wait: Team Lead 'Is this worth our time?'",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "BLOCKED - Escalate with the Specific Question",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "PARKED - Carried to Next Weekly Batch (not deleted)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 1 - Wait: Team Lead 'Is this worth our time?'": {
+      "main": [
+        [
+          {
+            "node": "GATE 1 - Record Team Lead Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 1 - Record Team Lead Decision": {
+      "main": [
+        [
+          {
+            "node": "GATE 1 - Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 1 - Approved?": {
+      "main": [
+        [
+          {
+            "node": "PHASE 4a - Definer: Draft the PRD",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "TERMINATED at Gate 1 - Rejected (logged with reason)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHASE 4a - Definer: Draft the PRD": {
+      "main": [
+        [
+          {
+            "node": "PHASE 4b - Merge PRD into State + Self-Critique",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHASE 4b - Merge PRD into State + Self-Critique": {
+      "main": [
+        [
+          {
+            "node": "GATE 2 - Wait: Reporter 'Did we understand it?'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 2 - Wait: Reporter 'Did we understand it?'": {
+      "main": [
+        [
+          {
+            "node": "GATE 2 - Apply Reporter Edits to PRD",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 2 - Apply Reporter Edits to PRD": {
+      "main": [
+        [
+          {
+            "node": "PHASE 5 - Generate Wireframe Variants [platform capability]",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHASE 5 - Generate Wireframe Variants [platform capability]": {
+      "main": [
+        [
+          {
+            "node": "PHASE 6 - Build Internal App on Platform [platform capability]",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PHASE 6 - Build Internal App on Platform [platform capability]": {
+      "main": [
+        [
+          {
+            "node": "GATE 3 - Wait: Team Lead 'Safe to go live?' (DEFAULTS TO HALT)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 3 - Wait: Team Lead 'Safe to go live?' (DEFAULTS TO HALT)": {
+      "main": [
+        [
+          {
+            "node": "GATE 3 - Approved to Ship?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 3 - Approved to Ship?": {
+      "main": [
+        [
+          {
+            "node": "PHASE 7 - Deploy + Instrument for 30-Day Usage [platform capability]",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "HALTED at Gate 3 - Not Deployed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -1,0 +1,1305 @@
+{
+  "name": "Sprinto \u2014 Discovery to Shipped Internal Tool (full structural sketch, D1\u2013D12)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                3
+              ],
+              "triggerAtHour": 16,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      },
+      "id": "trig",
+      "name": "Schedule Trigger \u2014 Weekly, After the QCM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "notes": "D1: batch, not continuous. Continuous discovery floods the reviewer and turns the approval queue into the bottleneck. A weekly batch produces one reviewable shortlist and paces the whole pipeline.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "internal-friction-form",
+        "options": {}
+      },
+      "id": "form-hook",
+      "name": "Form Submission Endpoint (secondary input)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        320
+      ],
+      "webhookId": "form-hook-id",
+      "notes": "D1 secondary input: optional structured form, filed anytime. Catches what nobody says out loud in the QCM, and is the entry point for the below-threshold high-conviction route (D3). Persists to a store \u2014 does NOT trigger the pipeline (batch, not stream).",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "form-store",
+      "name": "Persist to Candidate Store",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        260,
+        320
+      ],
+      "notes": "PLATFORM: append-only store, swept by the weekly trigger. Batch-not-stream lives in this wiring, not just in prose.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCOUT - Normalise QCM + Form Inputs\n// D1: two sources, one shape. Deliberately does NOT judge or filter (D4) -\n// a filter with no human oversight is exactly where good ideas silently die.\n// This node's only job is: messy input -> structured candidate + evidence link.\n\nconst RAW = {\n  qcm: [\n    { role: 'compliance-analyst', person: 'p1', reportedAt: '2026-08-11',\n      problem: 'Manual SOC2 evidence collation',\n      description: 'Screenshots copied by hand into the evidence folder weekly.',\n      hoursPerWeek: 3, affected: 4, stress: 4 },\n    { role: 'compliance-analyst', person: 'p2', reportedAt: '2026-08-11',\n      problem: 'Chasing missing audit artefacts by hand',\n      description: 'Same underlying pain as evidence collation, different words.',\n      hoursPerWeek: 4, affected: 5, stress: 4 }\n  ],\n  form: [\n    { role: 'security-analyst', person: 'p7', reportedAt: '2026-08-10',\n      problem: 'Evidence folder always missing something at audit time',\n      description: 'I end up rebuilding the evidence trail from scratch every quarter.',\n      hoursPerWeek: 5, affected: 5, stress: 3 }\n  ]\n};\n\nconst out = [];\nfor (const [source, rows] of Object.entries(RAW)) {\n  for (const r of rows) {\n    out.push({ json: { candidate: {\n      id: `${source}-${r.person}-${r.reportedAt}`,\n      title: r.problem,\n      role: r.role,\n      source,\n      person: r.person,\n      reportedAt: r.reportedAt,\n      hoursPerWeek: r.hoursPerWeek,\n      affected: r.affected,\n      stress: r.stress,\n      description: r.description,\n      evidenceLink: `${source}#${r.person}#${r.reportedAt}`,   // traceable back to raw source\n      stage: 'normalised',\n      log: [{ agent: 'Scout-Normalise', action: 'normalised', at: new Date().toISOString() }]\n    }}});\n  }\n}\nreturn out;"
+      },
+      "id": "scout-norm",
+      "name": "SCOUT \u2014 Normalise QCM + Form Inputs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "notes": "D4: does NOT judge or filter. A filter with no human oversight is exactly where good ideas silently die \u2014 same principle as the below-threshold escape hatch, one step earlier. Output: structured candidates with evidence links back to the raw source.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCOUT - Cluster Similar Candidates\n// D9 test case 7: two teams raised the SAME problem in different words\n// (evidence collation vs chasing missing artefacts). Scored separately,\n// neither cleared 25% and both died - a real gap found while stress-testing\n// this design. Fix: group semantically similar candidates and COMBINE their\n// pools before scoring, so paraphrasing across teams can't kill a real signal.\n//\n// SKETCH: real clustering is an LLM/embedding job (OPEN \u2014 not implemented\n// here). Stubbed as fuzzy title matching so the sketch stays readable.\n\nfunction similar(a, b) {\n  const wa = new Set(a.toLowerCase().split(/\\W+/).filter(Boolean));\n  const wb = new Set(b.toLowerCase().split(/\\W+/).filter(Boolean));\n  const overlap = [...wa].filter(w => wb.has(w)).length;\n  return overlap >= 2; // crude stand-in for a real similarity model\n}\n\nconst candidates = $input.all().map(i => i.json.candidate);\nconst clusters = [];\n\nfor (const c of candidates) {\n  const match = clusters.find(cl => similar(cl.title, c.title));\n  if (match) {\n    match.members.push(c);\n    match.rolesInvolved.add(c.role);\n  } else {\n    clusters.push({ title: c.title, members: [c], rolesInvolved: new Set([c.role]) });\n  }\n}\n\nreturn clusters.map((cl, idx) => ({ json: { candidate: {\n  id: 'cluster-' + idx,\n  title: cl.members[0].title,\n  clusteredFrom: cl.members.map(m => m.title),\n  rolesInvolved: [...cl.rolesInvolved],\n  reports: cl.members,\n  stage: 'clustered',\n  log: [{ agent: 'Scout-Cluster', action: 'clustered', memberCount: cl.members.length,\n          note: cl.members.length > 1 ? 'pools combined across paraphrasing' : 'no match, single report' }]\n}}}));"
+      },
+      "id": "scout-cluster",
+      "name": "SCOUT \u2014 Cluster Similar Candidates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        0
+      ],
+      "notes": "D9 test case 7 (a real gap found stress-testing this design): two teams raised the same problem in different words, scored separately, neither cleared 25%, both died. Fix: group semantically similar candidates and COMBINE their pools before scoring. Clustering itself is an LLM/embedding job \u2014 OPEN, stubbed here as fuzzy title matching.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCORER - Threshold Check (25% role-pool, time-decayed)\n// D2/D3: 25% of the ROLE POOL, not raw headcount, weight halving every\n// quarter. 'A threshold may deprioritise an idea. It may never silently\n// kill one' - so below-threshold does not mean discarded, it means routed\n// differently (see the Switch node downstream).\n\nconst THRESHOLD = 0.25;\nconst HALF_LIFE_DAYS = 90;\nconst CONVICTION_HOURS = 4;\nconst CONVICTION_DESC_CHARS = 100;\nconst ROLE_POOL = { 'compliance-analyst': 4, 'security-analyst': 5, 'people-ops': 6 };\n\nconst now = Date.now();\nconst out = [];\n\nfor (const item of $input.all()) {\n  const c = item.json.candidate;\n  const roles = c.rolesInvolved || [c.role];\n  // combined pool across every role represented in the cluster\n  const pool = roles.reduce((sum, r) => sum + (ROLE_POOL[r] ?? 0), 0);\n  const reports = c.reports || [c];\n\n  if (!pool) {\n    c.confidence = 0.2;\n    c.unresolvedAssumptions = ['role-pool size unknown for: ' + roles.join(', ')];\n    c.routing = { route: 'needs_context' };\n    c.log.push({ agent: 'Scorer-Threshold', action: 'blocked', reason: 'unknown role-pool' });\n    out.push({ json: { candidate: c } });\n    continue;\n  }\n\n  const weighted = reports.reduce((sum, r) => {\n    const ageDays = (now - new Date(r.reportedAt).getTime()) / 86400000;\n    return sum + Math.pow(0.5, ageDays / HALF_LIFE_DAYS);\n  }, 0);\n  const decayedFraction = weighted / pool;\n\n  const highConviction = reports.some(r =>\n    r.source === 'form' &&\n    (r.hoursPerWeek ?? 0) >= CONVICTION_HOURS &&\n    (r.description || '').length >= CONVICTION_DESC_CHARS\n  );\n\n  c.threshold = { decayedFraction: Number(decayedFraction.toFixed(3)), thresholdUsed: THRESHOLD, pool };\n  c.routing = decayedFraction >= THRESHOLD\n    ? { route: 'high_signal' }\n    : highConviction\n      ? { route: 'low_signal_high_conviction' }\n      : { route: 'below_threshold_no_evidence' };\n\n  c.confidence = 0.85;\n  c.unresolvedAssumptions = [];\n  c.stage = 'thresholded';\n  c.log.push({ agent: 'Scorer-Threshold', action: 'thresholded', route: c.routing.route, fraction: c.threshold.decayedFraction });\n  out.push({ json: { candidate: c } });\n}\nreturn out;"
+      },
+      "id": "scorer-thresh",
+      "name": "SCORER \u2014 Threshold Check (25%, time-decayed)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        0
+      ],
+      "notes": "D2/D3: 25% of the ROLE POOL (combined across the cluster), weight halving every quarter. 'A threshold may deprioritise an idea. It may never silently kill one' \u2014 below-threshold routes differently, it is never discarded.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "You are the Scorer. Return TWO separate scores, never collapsed into one number: impactScore (0-100, direct hours/speed + indirect morale/retention effect of visibly fixing reported problems) and sentimentScore (0-100, distress level). Also assess recurrence, automatability (rule-shaped scores high; judgment-shaped work is a bad first target), and blastRadius.\n\nTreat self-reported affected/stress ratings as WEAK, GAMEABLE signals - people anchor differently and scores inflate once staff learn high numbers get action. Cross-check against reported hours lost and recurrence.\n\nEmit confidence (0-1) and unresolvedAssumptions - the system is allowed to be uncertain, but never allowed to hide it.\n\nReply JSON only: {impactScore, sentimentScore, recurrence, automatability, blastRadius, confidence, unresolvedAssumptions:[string]}",
+              "role": "system"
+            },
+            {
+              "content": "={{ JSON.stringify($json.candidate) }}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "id": "scorer-llm",
+      "name": "SCORER \u2014 Impact + Sentiment Scores",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        1040,
+        0
+      ],
+      "notes": "Two scores, always kept separate \u2014 impact (value of fixing) and sentiment (distress), plus confidence + unresolved assumptions. Sentiment is a known-gameable weak signal, cross-checked against hours lost, per D2's stated limitation.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCORER - fold LLM impact/sentiment scores back into candidate state\n// State point worth keeping visible: the OpenAI node REPLACES the payload,\n// so the candidate is explicitly re-attached here or it's lost. This is the\n// concrete answer to 'how does state carry across agents' - re-attached at\n// every LLM boundary, never assumed to survive.\n\nconst out = [];\nconst prior = $('SCORER \u2014 Threshold Check (25%, time-decayed)').all();\n\nfor (let i = 0; i < $input.all().length; i++) {\n  const scored = $input.all()[i].json;\n  const c = prior[i].json.candidate;\n\n  const required = ['impactScore', 'sentimentScore', 'confidence', 'unresolvedAssumptions'];\n  const missing = required.filter(k => !(k in scored));\n\n  if (missing.length) {\n    c.qc = { status: 'schema_failed', missing };\n    c.routing = { route: 'needs_context' };\n  } else {\n    c.scores = scored;\n    c.scores.sentimentCaveat = 'self-reported, gameable; weak signal cross-checked against hours lost + recurrence';\n    c.confidence = scored.confidence;\n    c.unresolvedAssumptions = scored.unresolvedAssumptions;\n    if (scored.confidence < 0.5) c.routing = { route: 'needs_context' };\n  }\n\n  c.stage = 'scored';\n  c.log.push({ agent: 'Scorer-Score', action: 'scores_merged', qc: c.qc?.status ?? 'ok', confidence: c.confidence });\n  out.push({ json: { candidate: c } });\n}\nreturn out;"
+      },
+      "id": "scorer-merge",
+      "name": "SCORER \u2014 Merge Scores into State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        0
+      ],
+      "notes": "The LLM node replaces the payload, so candidate state is explicitly re-attached here \u2014 the concrete answer to 'how does state carry across agents'. Low-confidence output is routed to needs_context, not passed downstream.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCORER - Rank + Cap Shortlist (top 3-5/week)\n// D6/D10 fail-safe #3: a weekly batch paces input, but an uncapped shortlist\n// against a reviewer's limited time grows a queue forever. Cap the list;\n// everything below the cap PERSISTS with its scores and re-enters next\n// week's ranking rather than being dropped.\n\nconst CAP = 5;\n\nconst all = $input.all().map(i => i.json.candidate);\n\n// Blocked/low-confidence candidates are NOT filtered out here - they pass\n// through to the Switch and route to ESCALATE. Dropping them at this point\n// would be exactly the silent death the design promises never to allow.\nconst rankable = all.filter(c => c.routing?.route !== 'needs_context');\nconst blocked  = all.filter(c => c.routing?.route === 'needs_context');\n\nrankable.sort((a, b) => (b.scores?.impactScore ?? 0) - (a.scores?.impactScore ?? 0));\n\nrankable.forEach((c, idx) => {\n  c.shortlistRank = idx + 1;\n  c.shortlisted = idx < CAP;\n  // The cap has to change the ROUTE, not just set a flag, or capped items\n  // would still reach Gate 1 and the cap would be decorative.\n  if (!c.shortlisted) c.routing = { route: 'capped_persist' };\n  c.log.push({ agent: 'Scorer-Rank', action: c.shortlisted ? 'shortlisted' : 'capped_persist', rank: idx + 1 });\n});\n\nreturn [...rankable, ...blocked].map(c => ({ json: { candidate: c } }));"
+      },
+      "id": "scorer-rank",
+      "name": "SCORER \u2014 Rank + Cap Shortlist (top 5/week)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        0
+      ],
+      "notes": "D6/D10 fail-safe #3: an uncapped shortlist against a reviewer's limited time grows a queue forever. Below-cap candidates PERSIST with their scores and re-enter next week's ranking \u2014 never dropped.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r0",
+                    "leftValue": "={{ $json.candidate.routing.route }}",
+                    "rightValue": "high_signal",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Route A \u2014 high-signal (\u226525% role-pool)"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r1",
+                    "leftValue": "={{ $json.candidate.routing.route }}",
+                    "rightValue": "low_signal_high_conviction",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Route B \u2014 below threshold, high conviction"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r2",
+                    "leftValue": "={{ $json.candidate.routing.route }}",
+                    "rightValue": "needs_context",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Blocked \u2014 needs context"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Persists \u2014 capped or below threshold, re-enters next week"
+        }
+      },
+      "id": "switch1",
+      "name": "Switch \u2014 Route to Gate 1 (two entry routes)",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1820,
+        0
+      ],
+      "notes": "D3: two DELIBERATE routes converging on the same gate, not one path with a rare exception. Route A: sanity-check a strong signal, usually a fast approve. Route B: a genuine judgment call, overriding a threshold. Both reach a human \u2014 the design's central promise: a threshold may deprioritise, it may never silently kill.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "persist",
+      "name": "PERSIST \u2014 Capped/Below-threshold, Re-enters Next Week",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2080,
+        460
+      ],
+      "notes": "D6/D10: not a dead end. Score and evidence carry forward; re-scored against next week's fresh signal (recurrence weighting) rather than lost.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "escalate",
+      "name": "\ud83d\udd36 ESCALATE \u2014 Low Confidence / Blocked",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2080,
+        640
+      ],
+      "notes": "D8: 'The system is allowed to be uncertain. It is never allowed to hide it.' Routes here with the SPECIFIC unresolved question attached \u2014 not 'I'm stuck', but e.g. 'role-pool size unknown for security-analyst; which team owns that number?' Fed by every low-confidence branch in the pipeline (threshold, scoring, validation), not only this one entry point.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {}
+      },
+      "id": "gate1-wait",
+      "name": "GATE 1 \u2014 Wait: Worth our time? (AI Lead)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2080,
+        0
+      ],
+      "webhookId": "gate1-wait-hook",
+      "notes": "\ud83d\uded1 REVIEWER: AI implementation team lead. QUESTION: Is this worth our time? ACTION: pick from ranked shortlist, or reject. WHY HERE: cheap decision before an expensive artifact \u2014 writing the PRD first would ANCHOR the reviewer, a polished PRD makes a mediocre idea look legitimate. Non-blocking: other candidates keep scoring while this one waits.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// GATE 1 - record the AI lead's decision (append-only)\nconst c = $json.candidate ?? $('GATE 1 \u2014 Wait: Worth our time? (AI Lead)').first().json.candidate;\nconst decision = $json.body ?? { approved: true, reviewer: 'ai-impl-lead', decisionMs: 4200 };\n\nc.gate1 = {\n  reviewer: 'AI implementation team lead',\n  question: 'Is this worth our time?',\n  approved: decision.approved !== false,\n  decisionMs: decision.decisionMs ?? null,\n  decidedAt: new Date().toISOString()\n};\nc.stage = c.gate1.approved ? 'gate1_approved' : 'gate1_rejected';\nc.log.push({ agent: 'Gate1-Human', action: c.stage, decisionMs: c.gate1.decisionMs });\nreturn [{ json: { candidate: c } }];"
+      },
+      "id": "gate1-rec",
+      "name": "GATE 1 \u2014 Record Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        0
+      ],
+      "notes": "Appends to the decision log \u2014 who, when, what. Feeds the Rubber-Stamp Detector and makes gate rejection rate (D11) measurable after the fact.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// RUBBER-STAMP DETECTOR\n// D10 fail-safe #1: gate rejection rate is a metric, but a metric with no\n// mechanism is decorative. If a reviewer approves N consecutive items in\n// under X seconds each, flag it - the review almost certainly wasn't real.\n\nconst N_CONSECUTIVE = 3;\nconst X_SECONDS = 10;\n\n// SKETCH: reads recent gate decisions for this reviewer from the decision\n// log store. Stubbed as the current item's timing only.\nconst c = $json.candidate;\nconst decisionMs = c.gate1?.decisionMs ?? c.gate2?.decisionMs ?? c.gate3?.decisionMs;\nconst suspiciouslyFast = decisionMs != null && decisionMs < X_SECONDS * 1000;\n\nif (suspiciouslyFast) {\n  c.rubberStampFlag = {\n    flagged: true,\n    reason: `decision made in ${decisionMs}ms, below ${X_SECONDS}s threshold`,\n    note: `PLATFORM: track streak per-reviewer; flag at ${N_CONSECUTIVE} consecutive fast approvals`\n  };\n  c.log.push({ agent: 'RubberStampDetector', action: 'flagged', decisionMs });\n} else {\n  c.log.push({ agent: 'RubberStampDetector', action: 'ok' });\n}\n\nreturn [{ json: { candidate: c } }];"
+      },
+      "id": "rubberstamp",
+      "name": "RUBBER-STAMP DETECTOR",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2340,
+        220
+      ],
+      "notes": "D10 fail-safe #1: gate rejection rate is a metric, but a metric with no mechanism is decorative. If a reviewer approves N consecutive items in under X seconds each, flag it. Fed by all three gates' decision-record nodes, not just Gate 1.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.candidate.gate1.approved }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "gate1-if",
+      "name": "GATE 1 \u2014 Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2600,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "gate1-term",
+      "name": "Terminated at Gate 1 (logged with reason)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2860,
+        320
+      ],
+      "notes": "Where the loop exits early. Logged, not discarded \u2014 rejection rate too low signals rubber-stamping, too high signals discovery is broken.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "You are the Definer. Draft a PRD grounded only in the evidence supplied - do not invent requirements the evidence doesn't support; list gaps in openQuestions instead. A plausible-but-wrong PRD is the worst failure mode here: it looks fine and ships the wrong thing.\n\nIf this is a retry, validationErrors from the previous attempt are attached - fix those specific issues.\n\nWrite the problem statement in the reporters' own words so Gate 2 (the requester) can tell at a glance whether it was understood.\n\nReply JSON only: {problem, users:[string], scope:{inScope:[string], outOfScope:[string]}, requirements:[string], successCriteria:[string], claimedTimeSavingHrsPerWeek:number, openQuestions:[string], confidence}",
+              "role": "system"
+            },
+            {
+              "content": "={{ JSON.stringify($json.candidate) }}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "id": "definer",
+      "name": "DEFINER \u2014 Draft PRD",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        2860,
+        0
+      ],
+      "notes": "Only runs after Gate 1, so no compute is spent on ideas not worth doing. Grounded only in Scout's evidence \u2014 an invented requirement here is exactly the plausible-but-wrong-PRD failure mode (D9), the worst case because it looks fine and ships wrong.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// VALIDATE - Schema + Semantic Check (D7)\n// Shape validation alone is insufficient - syntactically valid JSON can still\n// describe a different problem than the one raised. So this checks MEANING,\n// not just structure: does the PRD's user list match the role-pool that\n// actually reported it, do stated time savings fall in the same range as\n// reported hours lost, does scope reference Scout's evidence.\n// Retry once with the error fed back; escalate on second failure - never\n// pass bad data downstream.\n\n// The Definer is an LLM node, so its output IS the PRD - it replaces the\n// payload entirely and the candidate does not survive it. State is therefore\n// re-attached from the last node that emitted it, and the PRD is taken from\n// this node's own input. Getting this wrong is silent: the workflow would\n// read `undefined.prd` and die one node later with no clue why.\nconst c = $('GATE 1 \u2014 Record Decision').first().json.candidate;\nconst prd = $json;\nc.prd = prd;\n\n// Retry count must come from $runIndex, NOT from the candidate object.\n// On a loop-back, $('GATE 1 \u2014 Record Decision') returns the same snapshot\n// every time, so a counter stored on the candidate would reset to 0 forever\n// and the retry loop would never terminate.\nconst retryCount = $runIndex;\n\nconst shapeOk = prd && prd.problem && Array.isArray(prd.users) && Array.isArray(prd.requirements) && Array.isArray(prd.successCriteria);\n\nconst reportedRoles = new Set((c.reports || [c]).map(r => r.role));\nconst usersMatchRoles = shapeOk && prd.users.some(u =>\n  [...reportedRoles].some(r => u.toLowerCase().includes(r.split('-')[0])));\n\nconst reports = c.reports || [c];\nconst claimedHours = shapeOk ? (prd.claimedTimeSavingHrsPerWeek ?? null) : null;\nconst reportedHours = reports.reduce((s, r) => s + (r.hoursPerWeek ?? 0), 0) / reports.length;\n// Guard the zero case explicitly - with reportedHours at 0 the tolerance\n// window collapses to zero width and every non-zero claim fails.\nconst hoursInRange = claimedHours == null || reportedHours === 0\n  || Math.abs(claimedHours - reportedHours) <= reportedHours * 0.6;\n\nconst semanticOk = usersMatchRoles && hoursInRange;\n\nif (!shapeOk || !semanticOk) {\n  const errors = [\n    !shapeOk && 'missing required PRD fields',\n    !usersMatchRoles && 'PRD user list does not match the role-pool that reported this problem',\n    !hoursInRange && 'claimed time saving is far outside the reported hours lost'\n  ].filter(Boolean);\n\n  // Retry ONCE, then escalate - D7. Three outcomes, so the node downstream\n  // is a Switch, not an IF: an IF has nowhere to put 'escalate' and would\n  // silently loop failures back to the Definer forever.\n  c.validationErrors = errors;   // fed back into the retry prompt\n  c.routing2 = retryCount < 1 ? 'retry' : 'escalate';\n  if (c.routing2 === 'escalate') {\n    c.unresolvedAssumptions = [...(c.unresolvedAssumptions || []), ...errors];\n  }\n  c.log.push({ agent: 'Validate', action: c.routing2, attempt: retryCount + 1, errors });\n} else {\n  c.routing2 = 'ok';\n  c.log.push({ agent: 'Validate', action: 'passed_shape_and_semantic_check', attempt: retryCount + 1 });\n}\n\nreturn [{ json: { candidate: c } }];"
+      },
+      "id": "validate",
+      "name": "VALIDATE \u2014 Schema + Semantic Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        0
+      ],
+      "notes": "D7, the strongest technical point in the design: shape validation alone is insufficient \u2014 a well-formed JSON PRD can still describe a different problem than the one raised (same class of bug as a tensor that passes an 'is this 2D' check while being semantically wrong). Checks whether the PRD's user list matches the reporting role-pool and whether claimed savings fall near reported hours. Retries once with the error fed back; escalates on second failure.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r0",
+                    "leftValue": "={{ $json.candidate.routing2 }}",
+                    "rightValue": "ok",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Passed"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r1",
+                    "leftValue": "={{ $json.candidate.routing2 }}",
+                    "rightValue": "retry",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Retry once \u2014 errors fed back"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Escalate \u2014 failed twice"
+        }
+      },
+      "id": "validate-switch",
+      "name": "VALIDATE \u2014 Outcome? (pass / retry once / escalate)",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        3380,
+        0
+      ],
+      "notes": "Three outcomes, so this is a Switch and not an IF. An IF has only two branches, which would leave 'escalate' nowhere to go and silently loop every repeat failure back into the Definer forever. Retry count comes from $runIndex, because a counter stored on the candidate resets on every loop-back.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-4o-mini"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "You are the PRD self-critique checker. Grade the PRD against a checklist BEFORE any human sees it, so obvious gaps never waste human attention: are specific users named (not 'some users'), are success criteria measurable (numbers, not adjectives), is scope explicitly bounded (has an outOfScope list).\n\nReply JSON only: {passed:boolean, usersNamed:boolean, successCriteriaMeasurable:boolean, scopeBounded:boolean, gaps:[string]}",
+              "role": "system"
+            },
+            {
+              "content": "={{ JSON.stringify($('VALIDATE \u2014 Schema + Semantic Check').first().json.candidate.prd) }}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "id": "critique",
+      "name": "SELF-CRITIQUE \u2014 PRD Checklist",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.8,
+      "position": [
+        3640,
+        0
+      ],
+      "notes": "Named users? Measurable success criteria? Bounded scope? Runs BEFORE any human sees the PRD, so obvious gaps never consume Gate 2's scarce attention. Humans are the last catch here, not the first.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// SELF-CRITIQUE - fold the checklist result back into state\nconst critique = $json;\nconst c = $('VALIDATE \u2014 Schema + Semantic Check').first().json.candidate;\n\nc.prdSelfCritique = critique;\nc.stage = 'prd_self_critiqued';\nc.log.push({ agent: 'SelfCritique', action: 'checked', passed: critique.passed });\nreturn [{ json: { candidate: c } }];"
+      },
+      "id": "critique-merge",
+      "name": "SELF-CRITIQUE \u2014 Merge into State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3900,
+        0
+      ],
+      "notes": "Same state re-attachment pattern as every other LLM boundary in this pipeline.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {}
+      },
+      "id": "gate2-wait",
+      "name": "GATE 2 \u2014 Wait: Understood correctly? (Requester)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        4160,
+        0
+      ],
+      "webhookId": "gate2-wait-hook",
+      "notes": "\ud83d\uded1 REVIEWER: the person who RAISED the problem, not the AI lead \u2014 only they know whether the PRD describes their actual pain. QUESTION: Did the system understand the problem correctly? ACTION: edit and approve. WHY HERE: the cheapest possible place to catch a misread \u2014 every downstream step compounds this error. This is the costly review, deliberately placed in the middle where catching an error saves the most work.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// GATE 2 - apply the requester's edits to the PRD\nconst c = $('GATE 2 \u2014 Wait: Understood correctly? (Requester)').first().json.candidate;\nconst edits = $json.body?.prdEdits ?? {};\nconst decision = $json.body ?? { decisionMs: 30000 };\n\nc.prd = { ...c.prd, ...edits };\nc.gate2 = {\n  reviewer: 'the person who raised the problem',\n  question: 'Did the system understand the problem correctly?',\n  editedFields: Object.keys(edits),\n  decisionMs: decision.decisionMs ?? null,\n  approvedAt: new Date().toISOString()\n};\nc.stage = 'prd_approved';\nc.log.push({ agent: 'Gate2-Human', action: 'prd_approved', editedFields: c.gate2.editedFields });\nreturn [{ json: { candidate: c } }];"
+      },
+      "id": "gate2-apply",
+      "name": "GATE 2 \u2014 Apply Requester Edits",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4420,
+        0
+      ],
+      "notes": "Edited fields are logged individually \u2014 repeated edits to the same field signal the Definer prompt is systematically wrong, not just this one PRD.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "designer",
+      "name": "DESIGNER \u2014 Generate Wireframe [platform capability]",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        4680,
+        0
+      ],
+      "notes": "OUTSIDE N8N'S SCOPE. PLATFORM: 2-3 wireframe variants from the approved PRD. Variants, not one design \u2014 choosing beats blank-page review, and taste/internal convention isn't inferable from a PRD alone.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "builder",
+      "name": "BUILDER \u2014 Build App on Platform [platform capability]",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        4940,
+        0
+      ],
+      "notes": "OUTSIDE N8N'S SCOPE. PLATFORM: assembles the app from the approved PRD + design. D8: on an ambiguous PRD, builds the SMALLEST DEFENSIBLE VERSION and flags the ambiguity at Gate 3 \u2014 stopping wastes the run, guessing big is worse than guessing small, and the flag ensures a human sees the ambiguity before anything ships.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {}
+      },
+      "id": "gate3-wait",
+      "name": "GATE 3 \u2014 Wait: Safe to ship? (AI Lead)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        5200,
+        0
+      ],
+      "webhookId": "gate3-wait-hook",
+      "notes": "\ud83d\uded1 REVIEWER: AI implementation team lead. QUESTION: Is it safe to put this live? ACTION: one-click approve to ship. WHY HERE: blast radius, not quality \u2014 anything touching real internal data or another team's workflow needs a human first. ASYMMETRIC DEFAULT: this gate always defaults to HALT on timeout, unlike earlier low-risk gates.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// GATE 3 - record the AI lead's ship/no-ship decision\nconst c = $('GATE 3 \u2014 Wait: Safe to ship? (AI Lead)').first().json.candidate;\nconst decision = $json.body ?? { approved: true, decisionMs: 8000 };\n\nc.gate3 = {\n  reviewer: 'AI implementation team lead',\n  question: 'Is it safe to put this live?',\n  approved: decision.approved !== false,\n  decisionMs: decision.decisionMs ?? null,\n  ambiguityFlag: c.builderAmbiguityFlag ?? null,  // D8: Builder's own flag surfaces here\n  decidedAt: new Date().toISOString()\n};\nc.stage = c.gate3.approved ? 'gate3_approved' : 'gate3_halted';\nc.log.push({ agent: 'Gate3-Human', action: c.stage });\nreturn [{ json: { candidate: c } }];"
+      },
+      "id": "gate3-rec",
+      "name": "GATE 3 \u2014 Record Decision",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5460,
+        0
+      ],
+      "notes": "Surfaces any ambiguity flag the Builder attached (D8) directly in front of the reviewer at the moment of the ship decision.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.candidate.gate3.approved }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "gate3-if",
+      "name": "GATE 3 \u2014 Approved to Ship?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5720,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "gate3-halt",
+      "name": "Halted at Gate 3 \u2014 Not Deployed",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        5980,
+        320
+      ],
+      "notes": "Timeout or rejection both land here. Nothing ships without an explicit human yes.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "deploy",
+      "name": "DEPLOY \u2014 Ship to Internal Server [platform capability]",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        5980,
+        0
+      ],
+      "notes": "OUTSIDE N8N'S SCOPE. PLATFORM: deploys the app and starts usage instrumentation \u2014 the input the 30-day review below depends on.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "review-trig",
+      "name": "Schedule Trigger \u2014 30 Days Post-Deploy",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        5980,
+        640
+      ],
+      "notes": "D10 fail-safe #2: the pipeline used to end at deploy with nothing catching a tool that ships and turns out useless. The 30-day usage metric becomes a TRIGGER, not just a number in a report.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// 30-DAY REVIEW - still in use?\n// D10 fail-safe #2: the pipeline used to end at deploy, with nothing\n// handling a tool that ships and turns out useless or wrong. The 30-day\n// usage metric becomes a TRIGGER here, not just a number in a report.\n\nconst c = $json.candidate ?? { id: 'placeholder', title: 'placeholder' };\n\n// SKETCH: real usage telemetry comes from the platform. Stubbed.\nconst usageEvents30d = c.usageEvents30d ?? 7;\n\nc.review30Day = {\n  usageEvents30d,\n  stillInUse: usageEvents30d > 0,\n  checkedAt: new Date().toISOString()\n};\nc.log = [...(c.log || []), { agent: 'Review30Day', action: c.review30Day.stillInUse ? 'confirmed_in_use' : 'flagged_unused' }];\nreturn [{ json: { candidate: c } }];"
+      },
+      "id": "review30",
+      "name": "30-DAY REVIEW \u2014 Still in Use?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6240,
+        640
+      ],
+      "notes": "D11: the headline metric is % of shipped tools still in use after 30 days \u2014 deliberately not 'apps shipped', which rewards volume over usefulness.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.candidate.review30Day.stillInUse }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "review-if",
+      "name": "30-DAY REVIEW \u2014 Keep or Retire?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6500,
+        640
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "review-ok",
+      "name": "Confirmed Useful \u2014 No Action",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        6760,
+        500
+      ],
+      "notes": "Tool earns its keep. No human action needed.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "review-retire",
+      "name": "RETIRE / ROLLBACK \u2014 Flagged for Human Decision",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        6760,
+        780
+      ],
+      "notes": "PLATFORM: unused tool flagged to the AI implementation lead for retire-or-rollback. The metric now has a mechanism attached to it, not just a dashboard number.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "content": "## Sprinto \u2014 Discovery to Shipped Internal Tool\n### STRUCTURAL SKETCH \u2014 NOT A RUNNABLE WORKFLOW\n\nImplements DESIGN_DECISIONS_FINAL.md (D1\u2013D12) in full.\nRead left to right; escalation/review branches sit below the main line.\nEvery node's **notes** field (document icon) carries the reasoning \u2014\nthat is where the defensible content lives, open them.\n\nRaw inputs stubbed, LLM nodes uncredentialed, platform-capability\nsteps are NoOp placeholders. This exists to pressure-test hand-offs\nand to illustrate the submission, not to run.",
+        "height": 320,
+        "width": 640,
+        "color": 7
+      },
+      "id": "s-title",
+      "name": "Note s-title",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -560
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### TWO ENTRY ROUTES INTO GATE 1\n\n**Route A \u2014 high-signal:** \u226525% of the (clustered) role-pool reports it in-window. Human is sanity-checking a strong signal.\n\n**Route B \u2014 below threshold, high-conviction:** a form submission carries real numbers (hours lost, concrete description). Human is making a genuine judgment call, overriding the threshold.\n\nBoth converge on the SAME gate. 'A threshold may deprioritise an idea. It may never silently kill one.'",
+        "height": 260,
+        "width": 520,
+        "color": 3
+      },
+      "id": "s-routes",
+      "name": "Note s-routes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1780,
+        -420
+      ]
+    },
+    {
+      "parameters": {
+        "content": "**GATE 1** \u2014 AI lead\nQ: *Is this worth our time?*\nAction: pick from shortlist, or reject.",
+        "height": 150,
+        "width": 340,
+        "color": 6
+      },
+      "id": "s-gate1",
+      "name": "Note s-gate1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2060,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "**GATE 2** \u2014 the requester (not the AI lead)\nQ: *Did we understand it correctly?*\nAction: edit and approve.",
+        "height": 150,
+        "width": 340,
+        "color": 6
+      },
+      "id": "s-gate2",
+      "name": "Note s-gate2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        4140,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "**GATE 3** \u2014 AI lead\nQ: *Is it safe to put this live?*\nAction: one-click approve. Defaults to HALT on timeout.",
+        "height": 150,
+        "width": 340,
+        "color": 6
+      },
+      "id": "s-gate3",
+      "name": "Note s-gate3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        5180,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### PLATFORM CAPABILITIES CLUSTER\nDesigner, Builder, Deploy are NoOp here \u2014 capabilities provided by the internal low-code platform, outside n8n's scope. Assumed per the brief: the platform can run multi-step agentic workflows, hold state, request human input mid-run, and deploy a simple app.",
+        "height": 200,
+        "width": 420,
+        "color": 3
+      },
+      "id": "s-noop",
+      "name": "Note s-noop",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        4660,
+        -420
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### STATE MODEL\nOne versioned `UseCase` record, read and written by every agent \u2014 nothing passed as loose context. Accumulates evidence \u2192 scores \u2192 PRD \u2192 design \u2192 build artifacts, plus an **append-only human decision log** (who, when, what changed).\n\nWhy: reject at step 4, re-run ONE agent, not the whole pipeline. And at a compliance company, the decision log means 'why did we build this' has an actual answer months later \u2014 auditability is not decoration.",
+        "height": 260,
+        "width": 520,
+        "color": 5
+      },
+      "id": "s-state",
+      "name": "Note s-state",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### THE HUMAN IS NEVER ON THE CRITICAL PATH\nWhile one candidate waits at a gate, ingestion, scoring and ranking keep running for every other candidate. A slow reviewer delays one item, never the pipeline.",
+        "height": 180,
+        "width": 420,
+        "color": 5
+      },
+      "id": "s-nonblock",
+      "name": "Note s-nonblock",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2340,
+        -420
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger \u2014 Weekly, After the QCM": {
+      "main": [
+        [
+          {
+            "node": "SCOUT \u2014 Normalise QCM + Form Inputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Form Submission Endpoint (secondary input)": {
+      "main": [
+        [
+          {
+            "node": "Persist to Candidate Store",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SCOUT \u2014 Normalise QCM + Form Inputs": {
+      "main": [
+        [
+          {
+            "node": "SCOUT \u2014 Cluster Similar Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SCOUT \u2014 Cluster Similar Candidates": {
+      "main": [
+        [
+          {
+            "node": "SCORER \u2014 Threshold Check (25%, time-decayed)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SCORER \u2014 Threshold Check (25%, time-decayed)": {
+      "main": [
+        [
+          {
+            "node": "SCORER \u2014 Impact + Sentiment Scores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SCORER \u2014 Impact + Sentiment Scores": {
+      "main": [
+        [
+          {
+            "node": "SCORER \u2014 Merge Scores into State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SCORER \u2014 Merge Scores into State": {
+      "main": [
+        [
+          {
+            "node": "SCORER \u2014 Rank + Cap Shortlist (top 5/week)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SCORER \u2014 Rank + Cap Shortlist (top 5/week)": {
+      "main": [
+        [
+          {
+            "node": "Switch \u2014 Route to Gate 1 (two entry routes)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch \u2014 Route to Gate 1 (two entry routes)": {
+      "main": [
+        [
+          {
+            "node": "GATE 1 \u2014 Wait: Worth our time? (AI Lead)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GATE 1 \u2014 Wait: Worth our time? (AI Lead)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "\ud83d\udd36 ESCALATE \u2014 Low Confidence / Blocked",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "PERSIST \u2014 Capped/Below-threshold, Re-enters Next Week",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 1 \u2014 Wait: Worth our time? (AI Lead)": {
+      "main": [
+        [
+          {
+            "node": "GATE 1 \u2014 Record Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 1 \u2014 Record Decision": {
+      "main": [
+        [
+          {
+            "node": "GATE 1 \u2014 Approved?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "RUBBER-STAMP DETECTOR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 1 \u2014 Approved?": {
+      "main": [
+        [
+          {
+            "node": "DEFINER \u2014 Draft PRD",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Terminated at Gate 1 (logged with reason)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DEFINER \u2014 Draft PRD": {
+      "main": [
+        [
+          {
+            "node": "VALIDATE \u2014 Schema + Semantic Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VALIDATE \u2014 Schema + Semantic Check": {
+      "main": [
+        [
+          {
+            "node": "VALIDATE \u2014 Outcome? (pass / retry once / escalate)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VALIDATE \u2014 Outcome? (pass / retry once / escalate)": {
+      "main": [
+        [
+          {
+            "node": "SELF-CRITIQUE \u2014 PRD Checklist",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "DEFINER \u2014 Draft PRD",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "\ud83d\udd36 ESCALATE \u2014 Low Confidence / Blocked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SELF-CRITIQUE \u2014 PRD Checklist": {
+      "main": [
+        [
+          {
+            "node": "SELF-CRITIQUE \u2014 Merge into State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SELF-CRITIQUE \u2014 Merge into State": {
+      "main": [
+        [
+          {
+            "node": "GATE 2 \u2014 Wait: Understood correctly? (Requester)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 2 \u2014 Wait: Understood correctly? (Requester)": {
+      "main": [
+        [
+          {
+            "node": "GATE 2 \u2014 Apply Requester Edits",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 2 \u2014 Apply Requester Edits": {
+      "main": [
+        [
+          {
+            "node": "DESIGNER \u2014 Generate Wireframe [platform capability]",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "RUBBER-STAMP DETECTOR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DESIGNER \u2014 Generate Wireframe [platform capability]": {
+      "main": [
+        [
+          {
+            "node": "BUILDER \u2014 Build App on Platform [platform capability]",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BUILDER \u2014 Build App on Platform [platform capability]": {
+      "main": [
+        [
+          {
+            "node": "GATE 3 \u2014 Wait: Safe to ship? (AI Lead)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 3 \u2014 Wait: Safe to ship? (AI Lead)": {
+      "main": [
+        [
+          {
+            "node": "GATE 3 \u2014 Record Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 3 \u2014 Record Decision": {
+      "main": [
+        [
+          {
+            "node": "GATE 3 \u2014 Approved to Ship?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "RUBBER-STAMP DETECTOR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GATE 3 \u2014 Approved to Ship?": {
+      "main": [
+        [
+          {
+            "node": "DEPLOY \u2014 Ship to Internal Server [platform capability]",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Halted at Gate 3 \u2014 Not Deployed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger \u2014 30 Days Post-Deploy": {
+      "main": [
+        [
+          {
+            "node": "30-DAY REVIEW \u2014 Still in Use?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "30-DAY REVIEW \u2014 Still in Use?": {
+      "main": [
+        [
+          {
+            "node": "30-DAY REVIEW \u2014 Keep or Retire?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "30-DAY REVIEW \u2014 Keep or Retire?": {
+      "main": [
+        [
+          {
+            "node": "Confirmed Useful \u2014 No Action",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "RETIRE / ROLLBACK \u2014 Flagged for Human Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

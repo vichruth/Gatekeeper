@@ -1,0 +1,162 @@
+{
+  "name": "Sprinto Sketch - Discover to Ship",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "trigger-1",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCOUT: reads raw sources, emits candidate problems with evidence\n// Dummy stand-in for real ingestion (Slack/tickets/meeting notes)\nconst candidates = [\n  {\n    id: 'uc-001',\n    title: 'Manual weekly SOC2 evidence collation',\n    evidence: [\n      { source: 'slack', quote: 'spent 3 hours again copying screenshots into the evidence folder', author: 'user_a' },\n      { source: 'ticket', quote: 'evidence collection is the worst part of my week', author: 'user_b' }\n    ],\n    raisedByCount: 2\n  },\n  {\n    id: 'uc-002',\n    title: 'Onboarding checklist manually tracked in a spreadsheet',\n    evidence: [\n      { source: 'meeting_notes', quote: 'we keep losing track of who finished which onboarding step', author: 'user_c' }\n    ],\n    raisedByCount: 1\n  }\n];\n\nreturn candidates.map(c => ({ json: { useCase: { ...c, stage: 'discovered', log: [{ agent: 'Scout', action: 'candidate_emitted' }] } } }));"
+      },
+      "id": "scout-1",
+      "name": "Scout",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// SCORER: scores frequency x time-cost x automatability x blast-radius, ranks, emits shortlist\nconst items = $input.all().map(i => i.json.useCase);\n\nconst scored = items.map(uc => {\n  const frequency = uc.raisedByCount;\n  const timeCost = 3; // placeholder — replace with your real scoring dimensions\n  const automatability = 4;\n  const blastRadius = 2; // lower = safer\n  const score = (frequency * timeCost * automatability) / blastRadius;\n  return { ...uc, score, stage: 'scored', log: [...uc.log, { agent: 'Scorer', action: 'scored', score }] };\n});\n\nscored.sort((a, b) => b.score - a.score);\n\nreturn scored.map(uc => ({ json: { useCase: uc } }));"
+      },
+      "id": "scorer-1",
+      "name": "Scorer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "content": "GATE 1 — HITL: pick one use case from ranked shortlist.\nReplace this node with a real approval step (e.g. Wait + webhook, or Form Trigger) once you decide the platform's mechanism.\nFor this sketch: manually pick the top item and continue.",
+        "height": 160,
+        "width": 260
+      },
+      "id": "gate1-note",
+      "name": "Gate 1 — Pick Use Case (HITL)",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [440, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Simulates: human picked the top-ranked candidate at Gate 1\nconst items = $input.all().map(i => i.json.useCase);\nconst chosen = items[0]; // top of ranked shortlist\nchosen.stage = 'chosen';\nchosen.log.push({ agent: 'Gate1-Human', action: 'approved_selection', pickedFrom: items.length });\nreturn [{ json: { useCase: chosen } }];"
+      },
+      "id": "gate1-sim",
+      "name": "Gate 1 Result (simulated)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// DEFINER: drafts PRD (problem, users, scope, requirements, success criteria)\nconst uc = $input.first().json.useCase;\n\nuc.prd = {\n  problem: uc.title,\n  users: ['placeholder — which internal team/role'],\n  scope: 'placeholder — in/out of scope',\n  requirements: ['placeholder requirement 1'],\n  successCriteria: ['placeholder metric'],\n  confidence: 0.7,\n  openAssumptions: ['placeholder — anything Definer had to guess']\n};\nuc.stage = 'defined';\nuc.log.push({ agent: 'Definer', action: 'prd_drafted' });\n\nreturn [{ json: { useCase: uc } }];"
+      },
+      "id": "definer-1",
+      "name": "Definer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 0]
+    },
+    {
+      "parameters": {
+        "content": "GATE 2 — HITL: approve/edit PRD.\nCheapest place to catch a misread problem before everything downstream compounds it.",
+        "height": 140,
+        "width": 260
+      },
+      "id": "gate2-note",
+      "name": "Gate 2 — Approve PRD (HITL)",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [880, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "const uc = $input.first().json.useCase;\nuc.log.push({ agent: 'Gate2-Human', action: 'prd_approved' });\nreturn [{ json: { useCase: uc } }];"
+      },
+      "id": "gate2-sim",
+      "name": "Gate 2 Result (simulated)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// DESIGNER: produces wireframe/mock-up options from approved PRD\nconst uc = $input.first().json.useCase;\n\nuc.design = {\n  variants: ['variant A: dashboard view', 'variant B: form + list view'],\n  chosenVariant: null\n};\nuc.stage = 'designed';\nuc.log.push({ agent: 'Designer', action: 'variants_generated' });\n\nreturn [{ json: { useCase: uc } }];"
+      },
+      "id": "designer-1",
+      "name": "Designer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 0]
+    },
+    {
+      "parameters": {
+        "content": "GATE 3 — HITL: choose between design variants (not blank-page review).\nTaste/internal convention isn't inferable from the PRD alone.",
+        "height": 140,
+        "width": 260
+      },
+      "id": "gate3-note",
+      "name": "Gate 3 — Approve Design (HITL)",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1320, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "const uc = $input.first().json.useCase;\nuc.design.chosenVariant = uc.design.variants[0];\nuc.log.push({ agent: 'Gate3-Human', action: 'design_chosen', chosen: uc.design.chosenVariant });\nreturn [{ json: { useCase: uc } }];"
+      },
+      "id": "gate3-sim",
+      "name": "Gate 3 Result (simulated)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// BUILDER: uses approved PRD + design to build the app on the platform\nconst uc = $input.first().json.useCase;\n\nuc.build = {\n  platformAppId: 'placeholder-app-id',\n  status: 'built_not_deployed'\n};\nuc.stage = 'built';\nuc.log.push({ agent: 'Builder', action: 'app_built' });\n\nreturn [{ json: { useCase: uc } }];"
+      },
+      "id": "builder-1",
+      "name": "Builder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, 0]
+    },
+    {
+      "parameters": {
+        "content": "GATE 4 — HITL: pre-deploy approval.\nBlast radius gate — anything touching real internal data/workflows needs a human before it's live.",
+        "height": 140,
+        "width": 260
+      },
+      "id": "gate4-note",
+      "name": "Gate 4 — Pre-Deploy Approval (HITL)",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1760, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "const uc = $input.first().json.useCase;\nuc.stage = 'shipped';\nuc.log.push({ agent: 'Gate4-Human', action: 'deploy_approved' });\nreturn [{ json: { useCase: uc } }];"
+      },
+      "id": "shipped-1",
+      "name": "Shipped",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 0]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": { "main": [[{ "node": "Scout", "type": "main", "index": 0 }]] },
+    "Scout": { "main": [[{ "node": "Scorer", "type": "main", "index": 0 }]] },
+    "Scorer": { "main": [[{ "node": "Gate 1 Result (simulated)", "type": "main", "index": 0 }]] },
+    "Gate 1 Result (simulated)": { "main": [[{ "node": "Definer", "type": "main", "index": 0 }]] },
+    "Definer": { "main": [[{ "node": "Gate 2 Result (simulated)", "type": "main", "index": 0 }]] },
+    "Gate 2 Result (simulated)": { "main": [[{ "node": "Designer", "type": "main", "index": 0 }]] },
+    "Designer": { "main": [[{ "node": "Gate 3 Result (simulated)", "type": "main", "index": 0 }]] },
+    "Gate 3 Result (simulated)": { "main": [[{ "node": "Builder", "type": "main", "index": 0 }]] },
+    "Builder": { "main": [[{ "node": "Shipped", "type": "main", "index": 0 }]] }
+  }
+}
