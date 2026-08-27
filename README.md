@@ -13,6 +13,8 @@ From raw signal to shipped tool — with humans in the loop where judgment actua
 
 **Runs entirely on free tiers. No paid API, no cloud bill, no vendor lock-in.**
 
+**🚧 Status: design complete (D1–D12), build in progress.** See the table below for what's actually running vs. what's designed.
+
 </div>
 
 ---
@@ -21,7 +23,7 @@ From raw signal to shipped tool — with humans in the loop where judgment actua
 
 This began as a take-home design exercise: *design an autonomous system that takes an internal use case from discovery → PRD → mock-up → shipped app, pausing for a human only where judgment genuinely adds value.*
 
-I didn't get the role. But the design was good, and designs that only exist as PDFs are worth nothing — so I built it.
+I didn't get the role. But the design was good, and designs that only exist as PDFs are worth nothing — so I'm building it.
 
 ---
 
@@ -110,9 +112,11 @@ A PRD can be perfectly-formed JSON and still describe the wrong problem. So vali
 
 ## 🚀 Quick start
 
+*Target usage once the build lands — see the status table above for what exists today.*
+
 ```bash
-git clone https://github.com/vichruth/signal-to-shipped
-cd signal-to-shipped
+git clone https://github.com/vichruth/Gatekeeper
+cd Gatekeeper
 
 # backend
 python -m venv .venv && source .venv/bin/activate
@@ -137,24 +141,24 @@ Being explicit about this, because a README that overclaims is worse than one th
 
 | | Component | Status |
 |:---:|---|---|
-| ✅ | Ingestion (form + meeting notes) | Built |
-| ✅ | Scout — normalise + semantic clustering | Built |
-| ✅ | Scorer — threshold, decay, dual scoring, routing | Built + tested |
-| ✅ | Definer — PRD generation | Built |
-| ✅ | Schema + semantic validation, bounded retry | Built |
-| ✅ | All three human gates + append-only decision log | Built |
-| ✅ | Approval dashboard | Built |
-| 🟡 | Designer / Builder agents | **Stubbed** — needs a platform capability this repo doesn't have |
+| ⬜ | Ingestion (form + meeting notes) | Not started |
+| ⬜ | Scout — normalise + semantic clustering | Not started |
+| ⬜ | Scorer — threshold, decay, dual scoring, routing | Not started |
+| ⬜ | Definer — PRD generation | Not started |
+| ⬜ | Schema + semantic validation, bounded retry | Not started |
+| ⬜ | All three human gates + append-only decision log | Not started |
+| ⬜ | Approval dashboard | Not started |
+| 🟡 | Designer / Builder agents | **Planned as stubs** — needs a platform capability this repo doesn't have |
 | 🟡 | Rubber-stamp detector | Designed, not built |
 | 🟡 | 30-day post-ship review | Designed, not built |
-| ❌ | Auth / access control | Known gap — demo uses a fixed reviewer |
+| ❌ | Auth / access control | Known gap — demo will use a fixed reviewer |
 | ❌ | Data retention policy | Known gap |
 
 ---
 
 ## 🧭 Design doc
 
-The full reasoning — all twelve decisions, the failure modes, the seven test scenarios it was stress-tested against (including one it originally **failed**) — is in [`docs/DESIGN.md`](docs/DESIGN.md).
+The full reasoning — all twelve decisions, the failure modes, the seven test scenarios it was stress-tested against (including one it originally **failed**) — lands in `docs/DESIGN.md` as part of the Phase 1 build (see `AGENTS.md`). Not written yet — this repo currently has the design and the build spec, not the code.
 
 ---
 

@@ -1,12 +1,28 @@
+# Internal session/design docs — kept out of the public repo deliberately
 /.claude
 /AI_Internship_Assignment.pdf
 /PROJECT_CONTEXT.md
 /PROJECT_LOG.md
-/README.md
 /SECURITY.md
 /design_desicions.md
 /document.pdf
 /llm_reasoning_debate.txt
 /pipeline-diagram.md
-/starting it 
 /video explanation.mp4
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+*.sqlite3
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# Secrets
+.env
+.env.local
